@@ -75,9 +75,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: NyaTerm-macos-arm64
-          path: |
-            dist/*.dmg
-            dist/*.app.tar.gz
+          path: dist/*.dmg
           overwrite: true
           if-no-files-found: error
           retention-days: 30
