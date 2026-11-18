@@ -13,9 +13,6 @@
 
 use std::collections::HashMap;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as B64;
-
 use crate::TerminalEffects;
 
 /// Maximum raw (pre-base64) bytes per `DATA` packet in read responses.
@@ -47,6 +44,9 @@ pub const MAX_WRITE_MIMES: usize = 16;
 
 /// Maximum MIME aliases (`walias`) in a single `write` transaction.
 pub const MAX_WRITE_ALIASES: usize = 16;
+
+const B64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// OSC terminator echoed in response packets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -148,7 +148,7 @@ pub fn encode_response_packet(
     encode_metadata(&mut out, op, status, primary, id, mime, pw);
     if !payload.is_empty() {
         out.push(b';');
-        out.extend_from_slice(B64.encode(payload).as_bytes());
+        out.extend_from_slice(b64_encode(payload).as_bytes());
     }
     out.extend_from_slice(terminator.as_bytes());
     out
@@ -254,7 +254,7 @@ fn encode_read_packets(
             if !listing.is_empty() {
                 listing.push(b'\n');
                 out.push(b';');
-                out.extend_from_slice(B64.encode(&listing).as_bytes());
+                out.extend_from_slice(b64_encode(&listing).as_bytes());
             }
         }
         out.extend_from_slice(terminator.as_bytes());
@@ -316,11 +316,11 @@ fn encode_metadata(
     }
     if let Some(mime) = mime {
         out.extend_from_slice(b":mime=");
-        out.extend_from_slice(B64.encode(mime.as_bytes()).as_bytes());
+        out.extend_from_slice(b64_encode(mime.as_bytes()).as_bytes());
     }
     if let Some(pw) = pw {
         out.extend_from_slice(b":pw=");
-        out.extend_from_slice(B64.encode(pw.as_bytes()).as_bytes());
+        out.extend_from_slice(b64_encode(pw.as_bytes()).as_bytes());
     }
 }
 
@@ -419,13 +419,35 @@ impl KittyClipboardState {
                 );
             }
             "write" => {
-                self.handle_write_start(id, primary, raw_mime, raw_pw, raw_name, terminator, effects);
+                self.handle_write_start(
+                    id,
+                    primary,
+                    raw_mime,
+                    raw_pw,
+                    raw_name,
+                    terminator,
+                    effects,
+                );
             }
             "wdata" => {
-                self.handle_wdata(raw_mime, raw_pw, raw_name, payload_bytes, terminator, effects);
+                self.handle_wdata(
+                    raw_mime,
+                    raw_pw,
+                    raw_name,
+                    payload_bytes,
+                    terminator,
+                    effects,
+                );
             }
             "walias" => {
-                self.handle_walias(raw_mime, raw_pw, raw_name, payload_bytes, terminator, effects);
+                self.handle_walias(
+                    raw_mime,
+                    raw_pw,
+                    raw_name,
+                    payload_bytes,
+                    terminator,
+                    effects,
+                );
             }
             _ => {}
         }
@@ -466,7 +488,7 @@ impl KittyClipboardState {
         if payload_bytes.is_empty() {
             return;
         }
-        let Ok(decoded_payload) = B64.decode(payload_bytes) else {
+        let Some(decoded_payload) = b64_decode_strict(payload_bytes) else {
             return;
         };
         let Ok(mimes_str) = std::str::from_utf8(&decoded_payload) else {
@@ -586,11 +608,12 @@ impl KittyClipboardState {
                 return;
             }
             // Finalize any remaining buffered base64 streams.
-            for (pending_mime, buf) in tx.pending_b64.drain() {
+            let pending = std::mem::take(&mut tx.pending_b64);
+            for (pending_mime, buf) in pending {
                 if buf.is_empty() {
                     continue;
                 }
-                let Ok(decoded) = B64.decode(&buf) else {
+                let Some(decoded) = b64_decode_strict(&buf) else {
                     Self::abort_write(&tx, KittyClipboardStatus::Einval, effects);
                     return;
                 };
@@ -654,7 +677,7 @@ impl KittyClipboardState {
         };
         if decode_len > 0 {
             let chunk: Vec<u8> = buf.drain(..decode_len).collect();
-            let Ok(decoded) = B64.decode(&chunk) else {
+            let Some(decoded) = b64_decode_strict(&chunk) else {
                 Self::abort_write(&tx, KittyClipboardStatus::Einval, effects);
                 return;
             };
@@ -697,7 +720,7 @@ impl KittyClipboardState {
             Self::abort_write(&tx, KittyClipboardStatus::Einval, effects);
             return;
         }
-        let Ok(decoded_target) = B64.decode(payload_bytes) else {
+        let Some(decoded_target) = b64_decode_strict(payload_bytes) else {
             Self::abort_write(&tx, KittyClipboardStatus::Einval, effects);
             return;
         };
@@ -705,7 +728,10 @@ impl KittyClipboardState {
             Self::abort_write(&tx, KittyClipboardStatus::Einval, effects);
             return;
         };
-        if dst_mime.is_empty() || dst_mime.len() > MAX_MIME_LEN || tx.aliases.len() >= MAX_WRITE_ALIASES {
+        if dst_mime.is_empty()
+            || dst_mime.len() > MAX_MIME_LEN
+            || tx.aliases.len() >= MAX_WRITE_ALIASES
+        {
             Self::abort_write(&tx, KittyClipboardStatus::Einval, effects);
             return;
         }
@@ -756,8 +782,94 @@ impl KittyClipboardState {
     }
 }
 
+fn b64_encode(input: &[u8]) -> String {
+    if input.is_empty() {
+        return String::new();
+    }
+    let mut out = Vec::with_capacity(input.len().div_ceil(3) * 4);
+    let mut chunks = input.chunks_exact(3);
+    for chunk in &mut chunks {
+        let n = (u32::from(chunk[0]) << 16) | (u32::from(chunk[1]) << 8) | u32::from(chunk[2]);
+        out.push(B64_ALPHABET[((n >> 18) & 0x3f) as usize]);
+        out.push(B64_ALPHABET[((n >> 12) & 0x3f) as usize]);
+        out.push(B64_ALPHABET[((n >> 6) & 0x3f) as usize]);
+        out.push(B64_ALPHABET[(n & 0x3f) as usize]);
+    }
+    match chunks.remainder() {
+        [b0] => {
+            let n = u32::from(*b0) << 16;
+            out.push(B64_ALPHABET[((n >> 18) & 0x3f) as usize]);
+            out.push(B64_ALPHABET[((n >> 12) & 0x3f) as usize]);
+            out.push(b'=');
+            out.push(b'=');
+        }
+        [b0, b1] => {
+            let n = (u32::from(*b0) << 16) | (u32::from(*b1) << 8);
+            out.push(B64_ALPHABET[((n >> 18) & 0x3f) as usize]);
+            out.push(B64_ALPHABET[((n >> 12) & 0x3f) as usize]);
+            out.push(B64_ALPHABET[((n >> 6) & 0x3f) as usize]);
+            out.push(b'=');
+        }
+        _ => {}
+    }
+    String::from_utf8(out).expect("ASCII base64 output")
+}
+
+fn b64_val(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+fn b64_decode_strict(input: &[u8]) -> Option<Vec<u8>> {
+    if input.is_empty() {
+        return Some(Vec::new());
+    }
+    if input.len() % 4 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(input.len() / 4 * 3);
+    for group in input.chunks_exact(4) {
+        let a = b64_val(group[0])?;
+        let b = b64_val(group[1])?;
+        match (group[2], group[3]) {
+            (b'=', b'=') => {
+                if (b & 0x0f) != 0 {
+                    return None;
+                }
+                out.push((a << 2) | (b >> 4));
+            }
+            (c_byte, b'=') => {
+                if c_byte == b'=' {
+                    return None;
+                }
+                let c = b64_val(c_byte)?;
+                if (c & 0x03) != 0 {
+                    return None;
+                }
+                out.push((a << 2) | (b >> 4));
+                out.push((b << 4) | (c >> 2));
+            }
+            (b'=', _) => return None,
+            (c_byte, d_byte) => {
+                let c = b64_val(c_byte)?;
+                let d = b64_val(d_byte)?;
+                out.push((a << 2) | (b >> 4));
+                out.push((b << 4) | (c >> 2));
+                out.push((c << 6) | d);
+            }
+        }
+    }
+    Some(out)
+}
+
 fn decode_b64_utf8(encoded: &str, max_len: usize) -> Option<String> {
-    let bytes = B64.decode(encoded.as_bytes()).ok()?;
+    let bytes = b64_decode_strict(encoded.as_bytes())?;
     if bytes.len() > max_len {
         return None;
     }
