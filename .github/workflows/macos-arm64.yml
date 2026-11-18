@@ -1,0 +1,83 @@
+name: Build macOS ARM64
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-macos-arm64-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  NYATERM_GITHUB_GIST_CLIENT_ID: ${{ vars.NYATERM_GITHUB_GIST_CLIENT_ID || 'nyaterm-fork-local' }}
+
+jobs:
+  package-macos-arm64:
+    name: Package macOS Apple Silicon (arm64)
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Read workspace version
+        id: meta
+        shell: bash
+        run: |
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          targets: aarch64-apple-darwin
+          cache-key: package-macos-arm64
+          cache-on-failure: 'true'
+          save-cache: always
+
+      - name: Install macOS build tools
+        shell: bash
+        run: brew install pkg-config
+
+      - name: Package native macOS ARM64 application
+        shell: bash
+        env:
+          NYATERM_ARTIFACT_VERSION: ${{ steps.meta.outputs.version }}
+          NYATERM_VERSION: ${{ steps.meta.outputs.version }}
+          TARGET: aarch64-apple-darwin
+        run: python3 scripts/release/package_native.py "${TARGET}"
+
+      - name: Verify native package
+        shell: bash
+        env:
+          TARGET: aarch64-apple-darwin
+          VERSION: ${{ steps.meta.outputs.version }}
+          ARTIFACT_VERSION: ${{ steps.meta.outputs.version }}
+        run: >-
+          python3 scripts/release/verify_native_package.py
+          --target "${TARGET}" --version "${VERSION}"
+          --artifact-version "${ARTIFACT_VERSION}" --dist dist
+
+      - name: Upload macOS ARM64 DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NyaTerm-macos-arm64
+          path: |
+            dist/*.dmg
+            dist/*.app.tar.gz
+          overwrite: true
+          if-no-files-found: error
+          retention-days: 30
