@@ -59,4 +59,10 @@ pub fn merge_terminal_effects(target: &mut TerminalEffects, mut incoming: Termin
         target.clipboard_store = incoming.clipboard_store.take();
     }
     target.clipboard_loads.append(&mut incoming.clipboard_loads);
+    target
+        .kitty_clipboard_reads
+        .append(&mut incoming.kitty_clipboard_reads);
+    target
+        .kitty_clipboard_writes
+        .append(&mut incoming.kitty_clipboard_writes);
 }

@@ -93,6 +93,13 @@ pub enum GraphicsEvent {
     },
     /// iTerm2 OSC 1337 `ClearScrollback`.
     ClearScrollback,
+    /// Kitty clipboard protocol (`OSC 5522`).
+    KittyClipboard {
+        /// Raw body after `ESC ] 5522 ;` up to the OSC terminator.
+        body: Vec<u8>,
+        /// Whether the sequence ended with `BEL` (`0x07`) rather than `ST` (`ESC \`).
+        bell_terminated: bool,
+    },
 }
 
 /// Ordered stream segments from the ingress scanner.
@@ -278,12 +285,12 @@ fn classify_kitty_apc(buf: &[u8], start: usize) -> SequenceClass {
 }
 
 fn classify_osc(buf: &[u8], start: usize) -> SequenceClass {
-    // ESC ] 1337 ; …
+    // ESC ] 1337 ; … or ESC ] 5522 ; …
     let after = start + 2;
     if after >= buf.len() {
         return SequenceClass::Incomplete;
     }
-    // Peek whether this is 1337 without consuming non-1337 OSCs.
+    // Peek whether this is 1337 or 5522 without consuming other OSCs.
     let rest = &buf[after..];
     if rest.starts_with(b"1337") {
         if rest.len() > 4 && rest[4] != b';' {
@@ -302,6 +309,27 @@ fn classify_osc(buf: &[u8], start: usize) -> SequenceClass {
                 }
             }
         }
+    } else if rest.starts_with(b"5522") {
+        if rest.len() == 4 {
+            return SequenceClass::Incomplete;
+        }
+        if rest[4] != b';' {
+            return SequenceClass::NotGraphics;
+        }
+        match find_osc_terminator(buf, after + 5) {
+            None => SequenceClass::Incomplete,
+            Some(term_at) => {
+                let body = &buf[after + 5..term_at];
+                let bell_terminated = buf.get(term_at) == Some(&0x07);
+                SequenceClass::Complete {
+                    end: osc_end(buf, term_at),
+                    event: Some(GraphicsEvent::KittyClipboard {
+                        body: body.to_vec(),
+                        bell_terminated,
+                    }),
+                }
+            }
+        }
     } else if is_incomplete_osc_prefix(rest) {
         SequenceClass::Incomplete
     } else {
@@ -310,13 +338,14 @@ fn classify_osc(buf: &[u8], start: usize) -> SequenceClass {
 }
 
 fn is_incomplete_osc_prefix(rest: &[u8]) -> bool {
-    // If we only have a prefix of "1337", wait for more bytes.
-    const TARGET: &[u8] = b"1337";
+    // If we only have a prefix of "1337" or "5522", wait for more bytes.
     if rest.is_empty() {
         return true;
     }
-    if rest.len() < TARGET.len() && TARGET.starts_with(rest) {
-        return true;
+    for target in [b"1337".as_slice(), b"5522".as_slice()] {
+        if rest.len() < target.len() && target.starts_with(rest) {
+            return true;
+        }
     }
     false
 }
@@ -888,7 +917,7 @@ impl TerminalGraphicsState {
         let cursor_line = i64::from(cursor_line).saturating_add(logical_origin);
         let mut result = GraphicsHandleResult::default();
         match event {
-            GraphicsEvent::ClearScrollback => {}
+            GraphicsEvent::ClearScrollback | GraphicsEvent::KittyClipboard { .. } => {}
             GraphicsEvent::Query {
                 image_id,
                 placement_id,

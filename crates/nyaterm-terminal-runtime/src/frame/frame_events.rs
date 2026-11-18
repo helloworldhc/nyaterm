@@ -412,6 +412,8 @@ pub(super) fn terminal_frame_output_event_can_drop_under_pressure(
         && frame.effects.pty_write.is_empty()
         && frame.effects.clipboard_store.is_none()
         && frame.effects.clipboard_loads.is_empty()
+        && frame.effects.kitty_clipboard_reads.is_empty()
+        && frame.effects.kitty_clipboard_writes.is_empty()
 }
 
 pub(super) const TERMINAL_FRAME_EVENT_QUEUE_CAP: usize = 1024;

@@ -988,7 +988,7 @@ impl NyaTermApp {
                     self.activate_session_id_with_surface_sync(&session_id, cx);
                 }
                 let text = nyaterm_core::format_local_terminal_drop_input(&path_strings);
-                if self.send_terminal_input(text.into_bytes(), cx) {
+                if self.send_terminal_paste_input_to_session(session_id, &text, cx) {
                     self.shell.set_status(format!(
                         "inserted {} path(s) into terminal",
                         path_strings.len()

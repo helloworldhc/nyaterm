@@ -5,6 +5,7 @@ use crate::TerminalScreen;
 pub struct TerminalProtocolState {
     pub focus_reporting: bool,
     pub bracketed_paste: bool,
+    pub kitty_paste_events: bool,
     pub mouse_reporting: bool,
     pub mouse_sgr: bool,
     pub mouse_utf8: bool,
@@ -26,6 +27,7 @@ impl TerminalProtocolState {
         Self {
             focus_reporting: screen.focus_reporting(),
             bracketed_paste: screen.bracketed_paste(),
+            kitty_paste_events: screen.kitty_paste_events(),
             mouse_reporting: screen.mouse_reporting(),
             mouse_sgr: screen.mouse_sgr(),
             mouse_utf8: screen.mouse_utf8(),

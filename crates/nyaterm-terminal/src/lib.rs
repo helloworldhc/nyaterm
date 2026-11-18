@@ -24,6 +24,7 @@ pub mod display_rows;
 pub mod editing;
 mod encoding;
 mod graphics;
+pub mod kitty_clipboard;
 mod kitty_payload;
 mod line_numbers;
 pub mod logical_lines;
@@ -567,6 +568,10 @@ pub struct TerminalEffects {
     pub clipboard_store: Option<String>,
     /// OSC 52 clipboard load formatters; host supplies clipboard text.
     pub clipboard_loads: Vec<TerminalClipboardLoad>,
+    /// Kitty clipboard protocol (`OSC 5522`) read requests.
+    pub kitty_clipboard_reads: Vec<kitty_clipboard::KittyClipboardReadRequest>,
+    /// Kitty clipboard protocol (`OSC 5522`) committed write transactions.
+    pub kitty_clipboard_writes: Vec<kitty_clipboard::KittyClipboardWriteCommit>,
 }
 
 impl std::fmt::Debug for TerminalEffects {
@@ -581,6 +586,14 @@ impl std::fmt::Debug for TerminalEffects {
             .field("pty_write_count", &self.pty_write.len())
             .field("clipboard_store", &self.clipboard_store)
             .field("clipboard_load_count", &self.clipboard_loads.len())
+            .field(
+                "kitty_clipboard_read_count",
+                &self.kitty_clipboard_reads.len(),
+            )
+            .field(
+                "kitty_clipboard_write_count",
+                &self.kitty_clipboard_writes.len(),
+            )
             .finish()
     }
 }
@@ -859,6 +872,7 @@ pub struct TerminalCore {
     cell_height_px: u16,
     graphics_ingress: GraphicsIngress,
     graphics: TerminalGraphicsState,
+    kitty_clipboard: kitty_clipboard::KittyClipboardState,
     /// Charset for session I/O (UTF-8 / GBK / …). Graphics stay on raw bytes.
     session_encoding: SessionEncoding,
     #[cfg(test)]
@@ -1050,6 +1064,7 @@ impl TerminalCore {
             cell_height_px: 18,
             graphics_ingress: GraphicsIngress::new(),
             graphics: TerminalGraphicsState::default(),
+            kitty_clipboard: kitty_clipboard::KittyClipboardState::default(),
             session_encoding: SessionEncoding::default(),
             #[cfg(test)]
             last_signature_scan_count: 0,
@@ -1402,6 +1417,11 @@ impl TerminalCore {
         self.term.mode().contains(TermMode::BRACKETED_PASTE)
     }
 
+    /// Kitty clipboard protocol paste events mode (`DECSET 5522`).
+    pub fn kitty_paste_events(&self) -> bool {
+        self.scroll_region_tracker.kitty_paste_events()
+    }
+
     pub fn mouse_reporting(&self) -> bool {
         self.term.mode().intersects(TermMode::MOUSE_MODE)
     }
@@ -1556,6 +1576,7 @@ impl TerminalCore {
         self.parser = ansi::Processor::new();
         self.scroll_region_tracker.reset_stream();
         self.graphics_ingress = GraphicsIngress::new();
+        self.kitty_clipboard.clear();
         self.session_encoding.reset_decoder();
         self.sidecar.osc = None;
     }
@@ -1564,6 +1585,8 @@ impl TerminalCore {
     /// Byte discontinuities within a connection must only use `reset_stream_state`.
     pub fn reset_session_input_protocols(&mut self) {
         self.drain_alacritty_events();
+        self.scroll_region_tracker.reset_kitty_paste_events();
+        self.kitty_clipboard.clear();
         for mode in [
             NamedPrivateMode::CursorKeys,
             NamedPrivateMode::ReportMouseClicks,
@@ -1761,6 +1784,18 @@ impl TerminalCore {
                 GraphicsSegmentRef::Event(event) => {
                     if event == GraphicsEvent::ClearScrollback {
                         self.clear_scrollback();
+                        return;
+                    }
+                    if let GraphicsEvent::KittyClipboard {
+                        body,
+                        bell_terminated,
+                    } = event
+                    {
+                        self.kitty_clipboard.handle_osc(
+                            &body,
+                            bell_terminated,
+                            &mut self.pending_effects,
+                        );
                         return;
                     }
                     let point = self.term.renderable_content().cursor.point;
@@ -2278,7 +2313,16 @@ impl TerminalCore {
                     self.pending_effects.bell = true;
                 }
                 Event::PtyWrite(text) => {
-                    self.pending_effects.pty_write.push(text.into_bytes());
+                    let bytes = if text == "\x1b[?5522;0$y" {
+                        if self.scroll_region_tracker.kitty_paste_events() {
+                            b"\x1b[?5522;1$y".to_vec()
+                        } else {
+                            b"\x1b[?5522;2$y".to_vec()
+                        }
+                    } else {
+                        text.into_bytes()
+                    };
+                    self.pending_effects.pty_write.push(bytes);
                 }
                 Event::ClipboardStore(_kind, text) => {
                     // Cap remote clipboard payloads to avoid pathological OSC 52 stores.
@@ -2614,6 +2658,7 @@ impl TerminalCore {
             self.primary_lines.pending_scroll_rows = 0;
             self.alternate_lines.pending_scroll_rows = 0;
             self.graphics.clear();
+            self.kitty_clipboard.clear();
             self.clear_snapshot_row_cache();
             self.consumed_reset_generation = reset_generation;
         }

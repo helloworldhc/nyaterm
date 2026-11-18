@@ -1643,10 +1643,15 @@ impl NyaTermApp {
         let mut pending_pty_writes = effects.pty_write;
         let mut clipboard_store = effects.clipboard_store;
         let mut clipboard_loads = effects.clipboard_loads;
+        let mut kitty_clipboard_reads = effects.kitty_clipboard_reads;
+        let mut kitty_clipboard_writes = effects.kitty_clipboard_writes;
         self.apply_terminal_title_effect(session_id, effects.title, effects.reset_title);
         self.handle_terminal_clipboard_effects(
+            session_id,
             &mut clipboard_store,
             &mut clipboard_loads,
+            &mut kitty_clipboard_reads,
+            &mut kitty_clipboard_writes,
             &mut pending_pty_writes,
             Some(cx),
         );
@@ -1692,10 +1697,18 @@ impl NyaTermApp {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn handle_terminal_clipboard_effects(
         &mut self,
+        session_id: &str,
         clipboard_store: &mut Option<String>,
         clipboard_loads: &mut Vec<TerminalClipboardLoad>,
+        kitty_clipboard_reads: &mut Vec<
+            nyaterm_terminal::kitty_clipboard::KittyClipboardReadRequest,
+        >,
+        kitty_clipboard_writes: &mut Vec<
+            nyaterm_terminal::kitty_clipboard::KittyClipboardWriteCommit,
+        >,
         pending_pty_writes: &mut Vec<Vec<u8>>,
         cx: Option<&mut Context<Self>>,
     ) {
@@ -1714,6 +1727,22 @@ impl NyaTermApp {
                         .set_status("OSC 52 clipboard write blocked by settings".to_string());
                 }
             }
+            for commit in kitty_clipboard_writes.drain(..) {
+                if self
+                    .settings
+                    .summary()
+                    .interaction_allow_osc52_clipboard_write
+                {
+                    if let Some(text) = commit.text {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                        self.shell
+                            .set_status("Kitty clipboard updated".to_string());
+                    }
+                } else {
+                    self.shell
+                        .set_status("Kitty clipboard write blocked by settings".to_string());
+                }
+            }
             if !clipboard_loads.is_empty() {
                 let clipboard_text = cx
                     .read_from_clipboard()
@@ -1725,13 +1754,61 @@ impl NyaTermApp {
                     pending_pty_writes,
                 );
             }
+            if !kitty_clipboard_reads.is_empty() {
+                let clipboard = cx.read_from_clipboard();
+                let available =
+                    super::clipboard_files::clipboard_available_kitty_mimes(clipboard.as_ref());
+                let avail_refs: Vec<&str> = available.iter().map(String::as_str).collect();
+                let active_otp = self
+                    .terminal
+                    .paste
+                    .kitty_paste_otps
+                    .get(session_id)
+                    .map(String::as_str);
+                for req in kitty_clipboard_reads.drain(..) {
+                    // If the client provides a `pw`, it must match the session's active paste OTP.
+                    if let Some(pw) = req.pw.as_deref()
+                        && active_otp != Some(pw)
+                    {
+                        pending_pty_writes.push(
+                            nyaterm_terminal::kitty_clipboard::encode_status_packet(
+                                nyaterm_terminal::kitty_clipboard::KittyClipboardOperation::Read,
+                                nyaterm_terminal::kitty_clipboard::KittyClipboardStatus::Eperm,
+                                false,
+                                &req.id,
+                                req.terminator,
+                            ),
+                        );
+                        continue;
+                    }
+                    let contents = super::clipboard_files::clipboard_kitty_contents_for_request(
+                        clipboard.as_ref(),
+                        &req,
+                    );
+                    pending_pty_writes.push(
+                        nyaterm_terminal::kitty_clipboard::encode_read_success(
+                            &req,
+                            &avail_refs,
+                            &contents,
+                        ),
+                    );
+                }
+            }
         } else {
-            if clipboard_store.take().is_some() {
+            if clipboard_store.take().is_some() || !kitty_clipboard_writes.is_empty() {
+                kitty_clipboard_writes.clear();
                 self.shell
                     .set_status("OSC 52 clipboard update skipped: UI unavailable".to_string());
             }
             if !clipboard_loads.is_empty() {
                 queue_osc52_clipboard_load_replies(clipboard_loads, "", pending_pty_writes);
+            }
+            for req in kitty_clipboard_reads.drain(..) {
+                pending_pty_writes.push(nyaterm_terminal::kitty_clipboard::encode_read_success(
+                    &req,
+                    &[],
+                    &[],
+                ));
             }
         }
     }
@@ -3128,6 +3205,8 @@ fn terminal_effects_need_ui_apply(effects: &TerminalEffects) -> bool {
         || !effects.pty_write.is_empty()
         || effects.clipboard_store.is_some()
         || !effects.clipboard_loads.is_empty()
+        || !effects.kitty_clipboard_reads.is_empty()
+        || !effects.kitty_clipboard_writes.is_empty()
 }
 
 fn terminal_snapshot_priority_session_ids(

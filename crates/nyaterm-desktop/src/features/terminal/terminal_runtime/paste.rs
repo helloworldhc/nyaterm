@@ -12,6 +12,12 @@ use crate::features::terminal::command_suggestions::paste::SuggestionPasteContex
 use crate::features::terminal::editing_payload::shell_edit_payload;
 use crate::features::terminal::editing_state::SnapshotEvidence;
 use crate::models::{is_multi_line_paste, normalize_paste_newlines};
+use nyaterm_terminal::kitty_clipboard::{KittyClipboardTerminator, encode_paste_event};
+use nyaterm_transport::SessionKind;
+
+use super::clipboard_files::{
+    clipboard_available_kitty_mimes, read_single_clipboard_image_file,
+};
 
 impl NyaTermApp {
     pub(in crate::features) fn paste_from_clipboard(
@@ -27,12 +33,64 @@ impl NyaTermApp {
             return;
         }
         let clipboard = cx.read_from_clipboard();
+        if let Some(session_id) = self
+            .session
+            .active_id_owned()
+            .filter(|session_id| !self.remote_desktop.is_session(session_id))
+            && self.session_kitty_paste_events(&session_id)
+        {
+            let mimes = clipboard_available_kitty_mimes(clipboard.as_ref());
+            let mime_refs: Vec<&str> = mimes.iter().map(String::as_str).collect();
+            let pw = nyaterm_core::uuid();
+            self.terminal
+                .paste
+                .kitty_paste_otps
+                .insert(session_id.clone(), pw.clone());
+            let packet = encode_paste_event(
+                &pw,
+                &mime_refs,
+                false,
+                KittyClipboardTerminator::St,
+            );
+            let _ = self.write_session_protocol_response(&session_id, &packet);
+            self.mark_user_activity();
+            cx.notify();
+            return;
+        }
         if let Some(clipboard) = clipboard.as_ref() {
             if let Some(paths) = clipboard.entries().iter().find_map(|entry| match entry {
                 gpui::ClipboardEntry::ExternalPaths(paths) => Some(paths),
                 _ => None,
             }) {
                 if let Some(id) = self.session.active_id_owned() {
+                    let is_remote = self
+                        .session
+                        .ordered_sessions()
+                        .into_iter()
+                        .find(|s| s.id == id)
+                        .is_some_and(|s| {
+                            matches!(
+                                s.kind,
+                                SessionKind::Ssh | SessionKind::Telnet | SessionKind::RawTcp
+                            )
+                        });
+                    if is_remote && self.settings.summary().terminal_paste_image_as_path {
+                        if let Some(image) = clipboard.entries().iter().find_map(|entry| {
+                            match entry {
+                                gpui::ClipboardEntry::Image(image) => Some(image.clone()),
+                                _ => None,
+                            }
+                        }) {
+                            self.paste_clipboard_image(image, cx);
+                            return;
+                        }
+                        if let Some((ext, _, bytes)) =
+                            read_single_clipboard_image_file(paths.paths())
+                        {
+                            self.paste_clipboard_image_bytes(ext, bytes, cx);
+                            return;
+                        }
+                    }
                     self.handle_terminal_external_file_drop(id, paths.paths().to_vec(), window, cx);
                 }
                 return;
@@ -165,6 +223,80 @@ impl NyaTermApp {
             .get(session_id)
             .map(|view| view.protocol_state.bracketed_paste)
             .unwrap_or(false)
+    }
+
+    pub(in crate::features) fn session_kitty_paste_events(&self, session_id: &str) -> bool {
+        self.terminal
+            .view
+            .views
+            .get(session_id)
+            .map(|view| view.protocol_state.kitty_paste_events)
+            .unwrap_or(false)
+    }
+
+    /// Send pasted text (such as a file or clipboard image path) to a specific
+    /// session, wrapping with bracketed paste (`\x1b[200~…\x1b[201~`) when that
+    /// session has `DECSET 2004` enabled so TUI apps recognize it as a paste.
+    pub(in crate::features) fn send_terminal_paste_input_to_session(
+        &mut self,
+        session_id: String,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if text.is_empty() {
+            return false;
+        }
+        if self.session.is_disconnected(&session_id) {
+            if self.set_terminal_status_if_changed(
+                "session disconnected — reconnect before sending".to_string(),
+            ) {
+                cx.notify();
+            }
+            return false;
+        }
+        let wire_bytes = match self.wrap_terminal_paste_bytes_for_session(&session_id, text) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                if self.set_terminal_status_if_changed(format!("paste failed: {error}")) {
+                    cx.notify();
+                }
+                return false;
+            }
+        };
+        let recording_bytes = text.as_bytes();
+        let navigation_candidate = if wire_bytes.starts_with(b"\x1b[200~") {
+            None
+        } else if self.session.active_id() == Some(session_id.as_str()) {
+            self.prepare_command_navigation_input(recording_bytes)
+        } else {
+            None
+        };
+        self.terminal.view.frame_pipeline.arm_output_event_wake();
+        match self.write_session_wire_input_recorded_as(&session_id, &wire_bytes, recording_bytes) {
+            Ok(()) => {
+                if self.session.active_id() == Some(session_id.as_str()) {
+                    self.note_shell_editing_input_with_navigation(
+                        recording_bytes,
+                        navigation_candidate,
+                        cx,
+                    );
+                }
+                self.record_command_history_for_sessions(&[session_id.as_str()], recording_bytes);
+                let terminal_status_changed = self
+                    .set_terminal_status_if_changed(format!("sent {} byte(s)", wire_bytes.len()));
+                self.arm_terminal_input_wake(cx);
+                if terminal_status_changed {
+                    cx.notify();
+                }
+                true
+            }
+            Err(error) => {
+                if self.set_terminal_status_if_changed(format!("paste failed: {error}")) {
+                    cx.notify();
+                }
+                false
+            }
+        }
     }
 
     pub(in crate::features) fn suggestion_paste_needs_bracketed_shell(&self) -> bool {

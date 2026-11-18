@@ -93,6 +93,8 @@ pub(super) struct TerminalInputState {
 pub(super) struct TerminalPasteReviewState {
     pub(super) editor: Option<Entity<NyaDocumentEditorState>>,
     pub(super) suggestion: Option<SuggestionPasteReview>,
+    /// Per-session one-time password issued for the latest `DECSET 5522` paste event.
+    pub(super) kitty_paste_otps: HashMap<String, String>,
     _subscription: Option<Subscription>,
 }
 
@@ -735,6 +737,7 @@ impl TerminalPasteReviewState {
         Self {
             editor: None,
             suggestion: None,
+            kitty_paste_otps: HashMap::new(),
             _subscription: None,
         }
     }

@@ -3090,7 +3090,7 @@ fn session_input_reset_preserves_screens_and_history_and_allows_new_protocols() 
                 .any(|line| line.contains("history"))
         );
 
-        screen.advance(b"\x1b[>31u\x1b[?1003;1006;1004;2004h");
+        screen.advance(b"\x1b[>31u\x1b[?1003;1006;1004;2004;5522h");
         assert!(screen.kitty_keyboard_disambiguate());
         assert!(screen.kitty_keyboard_report_event_types());
         assert!(screen.kitty_keyboard_report_all_keys_as_esc());
@@ -3098,6 +3098,20 @@ fn session_input_reset_preserves_screens_and_history_and_allows_new_protocols() 
         assert!(screen.mouse_sgr());
         assert!(screen.focus_reporting());
         assert!(screen.bracketed_paste());
+        assert!(screen.kitty_paste_events());
+
+        // DECRQM (?5522$p) reports set (1$y) while active and reset (2$y) after DECRST.
+        screen.advance(b"\x1b[?5522$p");
+        assert_eq!(
+            screen.take_effects().pty_write,
+            vec![b"\x1b[?5522;1$y".to_vec()]
+        );
+        screen.advance(b"\x1b[?5522l\x1b[?5522$p");
+        assert!(!screen.kitty_paste_events());
+        assert_eq!(
+            screen.take_effects().pty_write,
+            vec![b"\x1b[?5522;2$y".to_vec()]
+        );
     }
 }
 
