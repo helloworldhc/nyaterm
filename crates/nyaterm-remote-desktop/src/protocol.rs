@@ -270,6 +270,12 @@ pub enum RdpDisplayMode {
 }
 
 impl RdpDisplayConfig {
+    /// Offer the graphics pipeline at full color depth. Older profiles saved
+    /// false even when the server required GFX; the server chooses the channel.
+    pub fn advertises_graphics_pipeline(&self) -> bool {
+        self.color_depth != 16
+    }
+
     /// Ask the server for exactly the desktop the hosting panel will draw into.
     ///
     /// A fit-window session that connects at the saved size and is resized to

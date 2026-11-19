@@ -221,6 +221,8 @@ impl NyaTermApp {
                     t!("sessionInfo.codecs"),
                     if native_engine {
                         t!("sessionInfo.windowsManaged").to_string()
+                    } else if config.display.advertises_graphics_pipeline() {
+                        t!("sessionInfo.notMeasured").to_string()
                     } else {
                         t!("sessionInfo.bitmapUpdates").to_string()
                     },
@@ -229,16 +231,10 @@ impl NyaTermApp {
                     t!("sessionInfo.graphicsPipeline"),
                     if native_engine {
                         t!("sessionInfo.windowsManaged").to_string()
+                    } else if config.display.advertises_graphics_pipeline() {
+                        yes()
                     } else {
-                        format!(
-                            "{} ({})",
-                            if config.display.graphics_pipeline {
-                                yes()
-                            } else {
-                                no()
-                            },
-                            t!("sessionInfo.forcedOff"),
-                        )
+                        no()
                     },
                 ));
                 details.push((

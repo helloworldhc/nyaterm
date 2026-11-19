@@ -639,9 +639,7 @@ fn build_config(
     let clipboard = ClipboardBridge::new(session_id.to_string(), output_tx, true);
     let clipboard_factory = clipboard.clone();
     let use_credssp = config.use_nla && config.password.is_some();
-    // The fork implements Progressive decoding, but this path has not been
-    // validated end to end. Keep it disabled independently of the saved request.
-    let gfx_effective = graphics_pipeline_effective(config.display.graphics_pipeline);
+    let gfx_effective = config.display.advertises_graphics_pipeline();
     // One line per connection, always: it is the only record that this process
     // negotiated a session at all, and it carries no host, account, or password.
     // Options are what separate "the graphics pipeline was never asked for" from
@@ -680,7 +678,6 @@ fn build_config(
         .with_performance_flags(PerformanceFlags::from_bits_truncate(
             performance_flags_bits(&config.display),
         ))
-        // See `gfx_effective`: this channel remains unavailable in this release.
         .with_graphics_pipeline(gfx_effective)
         // `none` authentication must not submit a password or enter CredSSP.
         .with_credssp(use_credssp)
@@ -710,10 +707,6 @@ fn build_config(
     }
     let config = builder.build()?;
     Ok((config, clipboard))
-}
-
-fn graphics_pipeline_effective(_requested: bool) -> bool {
-    false
 }
 
 /// [MS-RDPBCGR] 2.2.1.11.1 performance flags, as a raw bit pattern.
@@ -1582,10 +1575,9 @@ mod tests {
         CertificateGate, DesktopOutputState, DesktopPayload, Outbound, build_config,
         classify_error, classify_failure, convert_and_send_input, convert_input,
         desktop_update_payload, error_chain, forward_full_frame_request, forward_output,
-        graphics_pipeline_effective, install_crypto_provider, is_transport_failure, output_channel,
-        performance_flags_bits, report_ironrdp_panic, rgb_u32_to_bgra, secure_attention_input,
-        send_iron_input, send_reliable_iron_input, validate_active_session_id,
-        validate_input_events,
+        install_crypto_provider, is_transport_failure, output_channel, performance_flags_bits,
+        report_ironrdp_panic, rgb_u32_to_bgra, secure_attention_input, send_iron_input,
+        send_reliable_iron_input, validate_active_session_id, validate_input_events,
     };
     use crate::client_name::resolve_client_name;
     use ironrdp_client::rdp::{DesktopUpdate, RdpInputEvent as IronInput, RdpInputSender};
@@ -1652,16 +1644,26 @@ mod tests {
     }
 
     #[test]
-    fn helper_keeps_graphics_pipeline_disabled_with_platform_decoders_available() {
-        let (output_tx, _output_rx) = mpsc::sync_channel(1);
-        let (config, _) = build_config(
-            "session",
-            &helper_config(),
-            output_tx,
-            Arc::new(CertificateGate::default()),
-        )
-        .unwrap();
-        assert!(!config.connector().support_dyn_vc_gfx_protocol);
+    fn helper_advertises_graphics_pipeline_for_default_and_saved_connections() {
+        for (depth, requested, expected) in [
+            (32, false, true),
+            (32, true, true),
+            (16, false, false),
+            (16, true, false),
+        ] {
+            let (output_tx, _output_rx) = mpsc::sync_channel(1);
+            let mut session = helper_config();
+            session.display.color_depth = depth;
+            session.display.graphics_pipeline = requested;
+            let (config, _) = build_config(
+                "session",
+                &session,
+                output_tx,
+                Arc::new(CertificateGate::default()),
+            )
+            .unwrap();
+            assert_eq!(config.connector().support_dyn_vc_gfx_protocol, expected);
+        }
     }
 
     #[test]
@@ -2071,12 +2073,6 @@ mod tests {
             (1, true, 0, 0, 2, 1, 8)
         );
         assert_eq!(pixels, [0x33, 0x22, 0x11, 0xff, 0xcc, 0xbb, 0xaa, 0xff]);
-    }
-
-    #[test]
-    fn graphics_pipeline_stays_off_for_both_saved_requests() {
-        assert!(!graphics_pipeline_effective(false));
-        assert!(!graphics_pipeline_effective(true));
     }
 
     #[test]
